@@ -1,0 +1,11 @@
+.idea/*
+.vscode/*
+
+/cmake-build*
+
+*.cmd
+*.ko
+*.mod*
+*.o
+*.order
+*.symvers
