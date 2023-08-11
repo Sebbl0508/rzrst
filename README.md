@@ -6,3 +6,9 @@ No
 > Why?  
 
 Because i wrote it :)
+
+## How to build & test
+(You have to have kernel headers installed, often the package is named `linux-headers`)
+- Build: `make build` (Ignore CMake, it's just for development with CLion)
+- Insert Module: `sudo insmod rzrst.ko`
+- Remove Module: `sudo rmmod rzrst`
