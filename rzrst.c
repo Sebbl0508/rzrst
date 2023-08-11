@@ -3,6 +3,9 @@
 #include <linux/init.h>
 #include <linux/hid.h>
 #include <linux/usb.h>
+#include <linux/netlink.h>
+#include <linux/cache.h>
+#include <net/genetlink.h>
 
 
 #define USB_VENDOR_ID_RAZER 0x1532
@@ -10,6 +13,26 @@
 
 #define RAZER_USB_SOUND_CARD_VOL_BUF_SIZE 2
 #define RAZER_USB_SOUND_CARD_STATE_BUF_SIZE 1
+
+enum rzr_cmd {
+    RZR_CMD_SET_VOLUME_STATE,
+    __RZR_CMD_MAX
+};
+#define RZR_CMD_MAX (__RZR_CMD_MAX - 1)
+
+enum rzr_attr {
+    RZR_ATTR_UNSPEC,
+    RZR_ATTR_STATE,
+    RZR_ATTR_VOLUME,
+    __RZR_ATTR_LAST
+};
+#define RZR_ATTR_MAX (__RZR_ATTR_LAST - 1)
+
+static const struct nla_policy rzr_attr_policy[RZR_ATTR_MAX + 1] = {
+    [RZR_ATTR_STATE]    = { .type = NLA_U8 },
+    [RZR_ATTR_VOLUME]   = { .type = NLA_U8 }
+};
+
 
 struct razer_usb_sound_card {
     struct usb_device* usb_dev;
@@ -203,6 +226,59 @@ static void razer_remove(struct hid_device* hdev) {
     hid_hw_stop(hdev);
 }
 
+static int rzr_set_volume_state(struct sk_buff* skb, struct genl_info* info) {
+    uint8_t in_attr_volume  = nla_get_u8(info->attrs[RZR_ATTR_VOLUME]);
+    uint8_t in_attr_state   = nla_get_u8(info->attrs[RZR_ATTR_STATE]);
+
+
+}
+
+
+// Generic Netlink registration
+
+static const struct genl_ops genl_ops[] = {
+    {
+        .cmd    = RZR_CMD_SET_VOLUME_STATE,
+        .doit   = rzr_set_volume_state,
+    }
+};
+
+static struct genl_family razer_genl_family __ro_after_init = {
+    .ops            = genl_ops,
+    .n_ops          = ARRAY_SIZE(genl_ops),
+    .name           = "rzrst",
+    .version        = 1,
+    .maxattr        = RZR_ATTR_MAX,
+    .module         = THIS_MODULE,
+    .policy         = rzr_attr_policy,
+    .netnsok        = true // ?
+};
+
+
+// module init & exit function
+static int __init rzr_mod_init(void) {
+    // TODO: move this into usb driver initialization
+    int ret = 0;
+
+    ret = genl_register_family(&razer_genl_family);
+    if(ret < 0) {
+        printk(KERN_ERR "rzrst: error registering generic netlink family: %d\n", ret);
+        goto init_err0;
+    }
+
+
+init_err0:
+    return ret;
+}
+
+static void __exit rzr_mod_exit(void) {
+    // TODO: move this into usb driver destruction
+    genl_unregister_family(&razer_genl_family);
+}
+module_init(rzr_mod_init);
+module_exit(rzr_mod_exit);
+
+// USB Driver registration
 
 static const struct hid_device_id razer_audio_devices[] = {
         { HID_USB_DEVICE(USB_VENDOR_ID_RAZER, USB_DEVICE_ID_RAZER_USB_SOUND_CARD) },
@@ -219,6 +295,6 @@ static struct hid_driver razer_driver = {
 module_hid_driver(razer_driver);
 
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPLv2");
 MODULE_AUTHOR("Sebbl0508");
 MODULE_DESCRIPTION("Sidetone driver for Razer USB sound card");
