@@ -5,8 +5,13 @@
 #include <linux/usb.h>
 #include <linux/netlink.h>
 #include <linux/cache.h>
+#include <linux/mutex.h>
+#include <net/netlink.h>
 #include <net/genetlink.h>
 
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("Sebbl0508");
+MODULE_DESCRIPTION("Sidetone driver for Razer USB sound card");
 
 #define USB_VENDOR_ID_RAZER 0x1532
 #define USB_DEVICE_ID_RAZER_USB_SOUND_CARD 0x0529
@@ -14,6 +19,8 @@
 #define RAZER_USB_SOUND_CARD_VOL_BUF_SIZE 2
 #define RAZER_USB_SOUND_CARD_STATE_BUF_SIZE 1
 
+
+// Generic Netlink registration
 enum rzr_cmd {
     RZR_CMD_SET_VOLUME_STATE,
     __RZR_CMD_MAX
@@ -28,13 +35,35 @@ enum rzr_attr {
 };
 #define RZR_ATTR_MAX (__RZR_ATTR_LAST - 1)
 
+static int rzr_set_volume_state(struct sk_buff* skb, struct genl_info* info);
+
 static const struct nla_policy rzr_attr_policy[RZR_ATTR_MAX + 1] = {
     [RZR_ATTR_STATE]    = { .type = NLA_U8 },
     [RZR_ATTR_VOLUME]   = { .type = NLA_U8 }
 };
 
+static const struct genl_ops genl_ops[] = {
+        {
+                .cmd    = RZR_CMD_SET_VOLUME_STATE,
+                .doit   = rzr_set_volume_state,
+        }
+};
+
+static struct genl_family razer_genl_family __ro_after_init = {
+        .id             = 0x0, // let the kernel generate an id
+        .ops            = genl_ops,
+        .n_ops          = ARRAY_SIZE(genl_ops),
+        .name           = "rzrst",
+        .version        = 1,
+        .maxattr        = RZR_ATTR_MAX,
+        .module         = THIS_MODULE,
+        .policy         = rzr_attr_policy,
+        .netnsok        = true // ?
+};
+
 
 struct razer_usb_sound_card {
+    struct hid_device* hdev;
     struct usb_device* usb_dev;
     struct urb* urb;
 
@@ -44,6 +73,16 @@ struct razer_usb_sound_card {
     uint8_t* volume_packet_data;
     uint8_t* state_packet_data;
 };
+
+
+static struct razer_usb_sound_card* usb_sound_card = NULL;
+/* THIS MUTEX ISN'T USED YET
+ * (What about removing the USB device while a genl message is being processed?)
+ * (What about changing volume/state?)
+ * (What about sending genl commands in a for loop?)
+ *   (-> the urb will be overwritten while it's in use :/)
+ */
+DEFINE_MUTEX(usb_sound_card_mtx);
 
 static const struct usb_ctrlrequest volume_req = {
     .bRequestType = 0x21,
@@ -67,6 +106,8 @@ static uint8_t data_set_on[1] = { 0x00 };
 static void razer_state_res_handler(struct urb* urb) {
     struct hid_device* hdev = urb->context;
 
+    // TODO: unlock mutex!
+
     if(urb->status)
         hid_err(hdev, "URB to set state failed with err %d\n", urb->status);
     else
@@ -77,7 +118,6 @@ static void razer_state_res_handler(struct urb* urb) {
 // -> on success sends the state packet
 static void razer_vol_res_handler(struct urb* urb) {
     struct hid_device* hdev = urb->context;
-    struct razer_usb_sound_card* usb_sound_card = hid_get_drvdata(hdev);
 
     int ret;
 
@@ -85,6 +125,8 @@ static void razer_vol_res_handler(struct urb* urb) {
         hid_err(hdev, "URB to set volume failed with err %d\n", urb->status);
         return;
     }
+
+    // TODO: lock usb_sound_card mutex
 
     usb_fill_control_urb(
         usb_sound_card->urb,
@@ -98,15 +140,40 @@ static void razer_vol_res_handler(struct urb* urb) {
     );
 
     ret = usb_submit_urb(usb_sound_card->urb, GFP_ATOMIC);
-    if(ret)
+    if(ret) {
         hid_err(hdev, "Error %d while submitting the set-state URB. Can't activate sidetone\n", ret);
+        // TODO: unlock usb_sound_card mutex
+    }
+}
+
+static void razer_send_usb_cmd(uint8_t volume, uint8_t state) {
+    int ret = 0;
+
+    usb_sound_card->state_packet_data[0] = state;
+
+    usb_fill_control_urb(
+        usb_sound_card->urb,
+        usb_sound_card->usb_dev,
+        usb_sndctrlpipe(usb_sound_card->usb_dev, 0),
+        (char*)usb_sound_card->volume_req,
+        usb_sound_card->volume_packet_data,
+        RAZER_USB_SOUND_CARD_VOL_BUF_SIZE,
+        razer_vol_res_handler,
+        usb_sound_card->hdev
+    );
+
+    ret = usb_submit_urb(usb_sound_card->urb, GFP_ATOMIC);
+    if(ret) {
+        hid_err(usb_sound_card->hdev, "Error %d while submitting set-volume URB. can't change sidetone volume.\n", ret);
+    }
 }
 
 // should active microphone sidetone with 100% volume on connection
 static int razer_probe(struct hid_device* hdev, const struct hid_device_id* id) {
     printk(KERN_INFO "rzrst: Got device\n");
 
-    struct razer_usb_sound_card* usb_sound_card = NULL;
+    // TODO: lock usb_sound_card mutex
+
     int ret = 0;
 
     if(!hid_is_usb(hdev)) {
@@ -178,28 +245,18 @@ static int razer_probe(struct hid_device* hdev, const struct hid_device_id* id) 
         goto error6;
     }
 
+    usb_sound_card->hdev    = hdev;
     usb_sound_card->usb_dev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
-    hid_set_drvdata(hdev, usb_sound_card);
 
-    usb_fill_control_urb(
-        usb_sound_card->urb,
-        usb_sound_card->usb_dev,
-        usb_sndctrlpipe(usb_sound_card->usb_dev, 0),
-        (char*)usb_sound_card->volume_req,
-        usb_sound_card->volume_packet_data,
-        RAZER_USB_SOUND_CARD_VOL_BUF_SIZE,
-        razer_vol_res_handler,
-        hdev
-    );
-    ret = usb_submit_urb(usb_sound_card->urb, GFP_ATOMIC);
-    if(ret) {
-        printk(KERN_WARNING "%d == EBADR\n", EBADR);
-        hid_err(hdev, "Error %d while submitting the set-volume URB. Can't activate sidetone.\n", ret);
+
+    // register generic netlink family
+    ret = genl_register_family(&razer_genl_family);
+    if(ret < 0) {
+        printk(KERN_ERR "rzrst: error registering generic netlink family: %d\n", ret);
         goto error7;
     }
 
     return ret;
-
 
 error7: kfree(usb_sound_card->state_packet_data);
 error6: kfree(usb_sound_card->volume_packet_data);
@@ -213,7 +270,7 @@ error0:
 }
 
 static void razer_remove(struct hid_device* hdev) {
-    struct razer_usb_sound_card* usb_sound_card = hid_get_drvdata(hdev);
+    genl_unregister_family(&razer_genl_family);
 
     usb_kill_urb(usb_sound_card->urb);
     kfree(usb_sound_card->volume_req);
@@ -229,54 +286,12 @@ static void razer_remove(struct hid_device* hdev) {
 static int rzr_set_volume_state(struct sk_buff* skb, struct genl_info* info) {
     uint8_t in_attr_volume  = nla_get_u8(info->attrs[RZR_ATTR_VOLUME]);
     uint8_t in_attr_state   = nla_get_u8(info->attrs[RZR_ATTR_STATE]);
+    printk(KERN_INFO "rzrst: set volume %d state %d\n", in_attr_volume, in_attr_state);
 
+    razer_send_usb_cmd(0, in_attr_state);
 
+    return 0;
 }
-
-
-// Generic Netlink registration
-
-static const struct genl_ops genl_ops[] = {
-    {
-        .cmd    = RZR_CMD_SET_VOLUME_STATE,
-        .doit   = rzr_set_volume_state,
-    }
-};
-
-static struct genl_family razer_genl_family __ro_after_init = {
-    .ops            = genl_ops,
-    .n_ops          = ARRAY_SIZE(genl_ops),
-    .name           = "rzrst",
-    .version        = 1,
-    .maxattr        = RZR_ATTR_MAX,
-    .module         = THIS_MODULE,
-    .policy         = rzr_attr_policy,
-    .netnsok        = true // ?
-};
-
-
-// module init & exit function
-static int __init rzr_mod_init(void) {
-    // TODO: move this into usb driver initialization
-    int ret = 0;
-
-    ret = genl_register_family(&razer_genl_family);
-    if(ret < 0) {
-        printk(KERN_ERR "rzrst: error registering generic netlink family: %d\n", ret);
-        goto init_err0;
-    }
-
-
-init_err0:
-    return ret;
-}
-
-static void __exit rzr_mod_exit(void) {
-    // TODO: move this into usb driver destruction
-    genl_unregister_family(&razer_genl_family);
-}
-module_init(rzr_mod_init);
-module_exit(rzr_mod_exit);
 
 // USB Driver registration
 
@@ -293,8 +308,3 @@ static struct hid_driver razer_driver = {
         .remove     = razer_remove
 };
 module_hid_driver(razer_driver);
-
-
-MODULE_LICENSE("GPLv2");
-MODULE_AUTHOR("Sebbl0508");
-MODULE_DESCRIPTION("Sidetone driver for Razer USB sound card");
