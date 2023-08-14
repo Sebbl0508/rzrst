@@ -288,7 +288,16 @@ static int rzr_set_volume_state(struct sk_buff* skb, struct genl_info* info) {
     uint8_t in_attr_state   = nla_get_u8(info->attrs[RZR_ATTR_STATE]);
     printk(KERN_INFO "rzrst: set volume %d state %d\n", in_attr_volume, in_attr_state);
 
-    razer_send_usb_cmd(0, in_attr_state);
+    uint8_t state = 0x00;
+    
+    // the sound card understands 0x01 as OFF and 0x00 as on
+    // -> API should behave like 0x00 is OFF and not 0x00 is ON
+    if(in_attr_state == 0x00)
+        state = 0x01;
+    else
+        state = 0x00;
+
+    razer_send_usb_cmd(0, state);
 
     return 0;
 }
