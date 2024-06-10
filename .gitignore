@@ -9,3 +9,6 @@
 *.o
 *.order
 *.symvers
+
+compile_commands.json
+.cache/*
